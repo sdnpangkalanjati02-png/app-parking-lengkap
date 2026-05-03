@@ -1,0 +1,8 @@
+{
+  "name": "Remix: ParkirPintar Manless",
+  "description": "Sistem parkir manless otomatis dengan dashboard manajemen real-time, integrasi QR code, dan keamanan Firebase yang diperketat.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": []
+}

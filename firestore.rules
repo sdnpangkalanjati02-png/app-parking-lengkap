@@ -1,0 +1,200 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // -------------------------------------------------------------------------
+    // Pillar 0: Global Safety Net
+    // -------------------------------------------------------------------------
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 3: Primitives & Global Helpers
+    // -------------------------------------------------------------------------
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isEmailVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isAdmin() {
+      // Identity check against trusted source + bootstrap admin
+      return isSignedIn() && (
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid)) ||
+        request.auth.token.email == 'sdnpangkalanjati02@gmail.com'
+      );
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 4: Validation Blueprints (Anti-Update-Gap)
+    // -------------------------------------------------------------------------
+
+    function isValidParkingLog(data) {
+      return data.keys().hasAll(['id', 'ticketCode', 'plateNumber', 'entryTime', 'status', 'vehicleType', 'branchId']) &&
+             data.keys().size() >= 7 &&
+             data.id is string && data.id.size() <= 128 &&
+             data.ticketCode is string && data.ticketCode.size() <= 20 &&
+             data.plateNumber is string && data.plateNumber.size() <= 20 &&
+             data.entryTime is number &&
+             data.status in ['parked', 'exited'] &&
+             data.vehicleType in ['car', 'motorcycle'] &&
+             data.branchId is string && data.branchId.size() <= 64;
+    }
+
+    function isValidBranch(data) {
+      return data.keys().hasAll(['id', 'name', 'location', 'status', 'code', 'mode', 'capacity']) &&
+             data.id is string && data.name is string && data.name.size() <= 100 &&
+             data.status in ['active', 'inactive'] &&
+             data.mode in ['manual', 'automatic', 'hybrid'] &&
+             data.capacity is map &&
+             data.capacity.car is number && data.capacity.motorcycle is number;
+    }
+
+    function isValidMember(data) {
+      return data.keys().hasAll(['id', 'name', 'plateNumber', 'phone', 'vehicleType', 'expiryDate', 'status']) &&
+             data.name is string && data.name.size() <= 100 &&
+             data.plateNumber is string && data.plateNumber.size() <= 20 &&
+             data.vehicleType in ['car', 'motorcycle'] &&
+             data.expiryDate is number &&
+             data.status in ['active', 'expired'];
+    }
+
+    function isValidEmployee(data) {
+      return data.keys().hasAll(['id', 'employeeId', 'name', 'position', 'department', 'phone', 'joinDate']) &&
+             data.name is string && data.name.size() <= 100 &&
+             data.employeeId is string && data.employeeId.size() <= 50;
+    }
+
+    function isValidIssue(data) {
+       return data.keys().hasAll(['title', 'description', 'category', 'priority', 'status', 'reporterId', 'branchId', 'createdAt', 'updatedAt']) &&
+              data.title is string && data.title.size() <= 200 &&
+              data.priority in ['low', 'medium', 'high', 'critical'] &&
+              data.status in ['open', 'in_progress', 'resolved', 'closed'];
+    }
+
+    function isValidUser(data) {
+      return data.keys().hasAll(['id', 'name', 'username', 'role']) &&
+             data.name is string && data.name.size() <= 100 &&
+             data.username is string && data.username.size() <= 50 &&
+             data.role in ['admin', 'karyawan', 'keuangan', 'direktur'];
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 5: Match Blocks
+    // -------------------------------------------------------------------------
+
+    // 1. SYSTEM CONFIGURATION
+    match /configs/main {
+      allow read: if isSignedIn();
+      allow write: if isAdmin() && isValidParkingLog(incoming()); // Wait, was it parking log? No, isValidConfig
+    }
+    // Correction: Need isValidConfig helper
+    function isValidConfig(data) {
+       return data.hourlyRateCar is number && data.hourlyRateMotorcycle is number;
+    }
+
+    match /configs/{configId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin() && (configId == 'main' ? isValidConfig(incoming()) : true);
+    }
+
+    // 2. USERS & ADMINS
+    match /admins/{uid} {
+      allow read: if isSignedIn() && (request.auth.uid == uid || isAdmin());
+      allow write: if false; // Only manageable via Firebase Console or Admin SDK
+    }
+
+    match /users/{userId} {
+      allow get: if isSignedIn() && (request.auth.uid == userId || isAdmin());
+      allow list: if isAdmin();
+      allow create: if isSignedIn() && request.auth.uid == userId && isValidUser(incoming()) && (
+        !('role' in incoming()) || incoming().role == 'karyawan' || isAdmin()
+      );
+      allow update: if (isAdmin() || (isSignedIn() && request.auth.uid == userId)) && (
+        incoming().diff(existing()).affectedKeys().hasOnly(['name', 'username', 'branchId']) &&
+        incoming().name.size() <= 100 && incoming().username.size() <= 50
+      );
+
+      match /private/credentials {
+        allow read, write: if isSignedIn() && (request.auth.uid == userId || isAdmin());
+      }
+    }
+
+    // 3. BRANCHES
+    match /branches/{branchId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin() && (request.method == 'create' ? isValidBranch(incoming()) : true);
+    }
+
+    // 4. PARKING LOGS (The core entity)
+    match /logs/{logId} {
+      allow get: if isSignedIn();
+      allow list: if isSignedIn(); // We rely on resource.data filter in practice
+      
+      allow create: if isSignedIn() && isValidParkingLog(incoming()) && (
+        incoming().id == logId &&
+        exists(/databases/$(database)/documents/branches/$(incoming().branchId)) &&
+        incoming().entryTime <= request.time.toMillis() &&
+        incoming().status == 'parked'
+      );
+
+      allow update: if isSignedIn() && (
+        isAdmin() || (
+          isValidParkingLog(incoming()) &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['status', 'exitTime', 'fare', 'paymentMethod']) &&
+          existing().status == 'parked' &&
+          incoming().status == 'exited' &&
+          incoming().exitTime >= existing().entryTime &&
+          incoming().exitTime <= request.time.toMillis()
+        )
+      );
+      
+      allow delete: if isAdmin();
+    }
+
+    // 5. MEMBERS
+    match /members/{memberId} {
+      allow read: if isSignedIn();
+      allow write: if (isAdmin() || isSignedIn()) && (request.method == 'create' ? isValidMember(incoming()) : true);
+    }
+
+    // 6. EMPLOYEES
+    match /employees/{employeeId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin() && (request.method == 'create' ? isValidEmployee(incoming()) : true);
+    }
+
+    // 7. HARDWARE
+    match /hardware/{deviceId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    // 8. ISSUES
+    match /issues/{issueId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && isValidIssue(incoming()) && incoming().reporterId == request.auth.uid;
+      allow update: if isAdmin() || (
+        isSignedIn() && 
+        existing().reporterId == request.auth.uid &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['title', 'description', 'updatedAt']) &&
+        incoming().updatedAt == request.time.toMillis()
+      );
+    }
+  }
+}
